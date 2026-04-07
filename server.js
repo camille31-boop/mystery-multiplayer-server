@@ -1,186 +1,267 @@
-const express = require("express");
-const http = require("http");
 const WebSocket = require("ws");
+const http = require("http");
 
-const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => {
-  res.send("Serveur du jeu multijoueur OK");
-});
-
-app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok" });
-});
-
-const server = http.createServer(app);
+const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
-const rooms = new Map();
+const rooms = {};
+
+function generateRoomCode(length = 6) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+
+  do {
+    code = "";
+    for (let i = 0; i < length; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+  } while (rooms[code]);
+
+  return code;
+}
 
 function send(ws, data) {
-  if (ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(data));
   }
 }
 
-function broadcast(roomCode, data) {
-  const room = rooms.get(roomCode);
+function broadcastToRoom(roomCode, data) {
+  const room = rooms[roomCode];
   if (!room) return;
 
-  const message = JSON.stringify(data);
+  Object.values(room.players).forEach((player) => {
+    send(player.ws, data);
+  });
+}
 
-  for (const player of room.players) {
-    if (player.ws.readyState === WebSocket.OPEN) {
-      player.ws.send(message);
-    }
+function getPlayerIds(room) {
+  return Object.keys(room.players);
+}
+
+function assignRoles(room) {
+  const ids = getPlayerIds(room);
+
+  if (ids.length >= 1) {
+    room.players[ids[0]].role = "series";
+  }
+
+  if (ids.length >= 2) {
+    room.players[ids[1]].role = "films";
   }
 }
 
-function generateRoomCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "";
-  for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
+function sendRoleUpdateToAll(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  Object.values(room.players).forEach((player) => {
+    send(player.ws, {
+      type: "ROOM_JOINED",
+      roomCode: room.code,
+      role: player.role
+    });
+  });
 }
 
 wss.on("connection", (ws) => {
   console.log("Client connecté");
 
-  ws.roomCode = null;
-  ws.role = null;
+  let currentPlayerId = null;
+  let currentRoomCode = null;
 
-  ws.on("message", (raw) => {
+  send(ws, {
+    type: "WELCOME",
+    message: "Connexion établie"
+  });
+
+  ws.on("message", (message) => {
     try {
-      const data = JSON.parse(raw.toString());
-      console.log("Message reçu :", data);
+      const data = JSON.parse(message.toString());
+      console.log("MESSAGE RECU :", data);
+
+      if (!data.type) {
+        send(ws, {
+          type: "ERROR",
+          message: "Type de message manquant"
+        });
+        return;
+      }
 
       switch (data.type) {
         case "CREATE_ROOM": {
-          let roomCode;
+          const playerId = data.playerId;
 
-          do {
-            roomCode = generateRoomCode();
-          } while (rooms.has(roomCode));
+          if (!playerId) {
+            send(ws, {
+              type: "ERROR",
+              message: "playerId manquant"
+            });
+            break;
+          }
 
-          const role = data.role || "series";
+          const roomCode = generateRoomCode();
 
-          rooms.set(roomCode, {
-            players: [{ ws, role }],
-            readyStates: new Map([[ws, false]])
-          });
+          rooms[roomCode] = {
+            code: roomCode,
+            players: {}
+          };
 
-          ws.roomCode = roomCode;
-          ws.role = role;
+          rooms[roomCode].players[playerId] = {
+            playerId,
+            ws,
+            role: "series",
+            ready: false
+          };
+
+          currentPlayerId = playerId;
+          currentRoomCode = roomCode;
 
           send(ws, {
             type: "ROOM_CREATED",
-            roomCode: roomCode,
-            role: role
+            roomCode,
+            role: "series"
           });
 
-          console.log(`Salle créée : ${roomCode}`);
+          send(ws, {
+            type: "PLAYER_JOINED",
+            playerCount: 1
+          });
+
+          console.log("SALLE CREEE :", roomCode);
           break;
         }
 
         case "JOIN_ROOM": {
+          const playerId = data.playerId;
           const roomCode = data.roomCode;
-          const room = rooms.get(roomCode);
+
+          if (!playerId || !roomCode) {
+            send(ws, {
+              type: "ERROR",
+              message: "playerId ou roomCode manquant"
+            });
+            break;
+          }
+
+          const room = rooms[roomCode];
 
           if (!room) {
             send(ws, {
               type: "ERROR",
               message: "Salle introuvable"
             });
-            return;
+            break;
           }
 
-          if (room.players.length >= 2) {
+          const idsBefore = getPlayerIds(room);
+
+          if (idsBefore.length >= 2 && !room.players[playerId]) {
             send(ws, {
               type: "ERROR",
-              message: "Salle déjà complète"
+              message: "Salle pleine"
             });
-            return;
+            break;
           }
 
-          const existingRole = room.players[0].role;
-          const role = existingRole === "series" ? "films" : "series";
+          room.players[playerId] = {
+            playerId,
+            ws,
+            role: "",
+            ready: false
+          };
 
-          room.players.push({ ws, role });
-          room.readyStates.set(ws, false);
+          assignRoles(room);
 
-          ws.roomCode = roomCode;
-          ws.role = role;
+          currentPlayerId = playerId;
+          currentRoomCode = roomCode;
 
-          send(ws, {
-            type: "JOIN_SUCCESS",
-            roomCode: roomCode,
-            role: role
-          });
+          // IMPORTANT : on renvoie le rôle à TOUS
+          sendRoleUpdateToAll(roomCode);
 
-          broadcast(roomCode, {
+          broadcastToRoom(roomCode, {
             type: "PLAYER_JOINED",
-            playerCount: room.players.length
+            playerCount: getPlayerIds(room).length
           });
 
-          console.log(`Joueur rejoint la salle : ${roomCode}`);
+          console.log(`JOUEUR ${playerId} A REJOINT ${roomCode}`);
           break;
         }
 
-        case "PLAYER_READY_START": {
-          const roomCode = ws.roomCode;
-          const room = rooms.get(roomCode);
-          if (!room) return;
+        case "SET_READY": {
+          const playerId = data.playerId;
+          const roomCode = data.roomCode;
+          const ready = data.ready;
 
-          room.readyStates.set(ws, true);
+          if (!playerId || !roomCode || typeof ready !== "boolean") {
+            send(ws, {
+              type: "ERROR",
+              message: "SET_READY invalide"
+            });
+            break;
+          }
 
-          const allReady =
-            room.players.length === 2 &&
-            room.players.every((p) => room.readyStates.get(p.ws) === true);
+          const room = rooms[roomCode];
 
-          if (allReady) {
-            broadcast(roomCode, {
-              type: "START_PROJECTOR"
+          if (!room) {
+            send(ws, {
+              type: "ERROR",
+              message: "Salle introuvable"
+            });
+            break;
+          }
+
+          if (!room.players[playerId]) {
+            send(ws, {
+              type: "ERROR",
+              message: "Joueur introuvable dans cette salle"
+            });
+            break;
+          }
+
+          room.players[playerId].ready = ready;
+
+          console.log(`SET_READY | ${playerId} | ${roomCode} | ${ready}`);
+
+          const players = Object.values(room.players);
+          const everyoneReady =
+            players.length === 2 &&
+            players.every((p) => p.ready === true);
+
+          if (everyoneReady) {
+            console.log("LES DEUX JOUEURS SONT PRETS");
+
+            broadcastToRoom(roomCode, {
+              type: "COUNTDOWN",
+              countdown: 3
             });
 
-            for (const p of room.players) {
-              room.readyStates.set(p.ws, false);
-            }
+            setTimeout(() => {
+              const roomStillExists = rooms[roomCode];
+              if (!roomStillExists) return;
 
-            console.log(`Démarrage projecteur dans la salle ${roomCode}`);
+              const currentPlayers = Object.values(roomStillExists.players);
+              const stillReady =
+                currentPlayers.length === 2 &&
+                currentPlayers.every((p) => p.ready === true);
+
+              if (stillReady) {
+                broadcastToRoom(roomCode, {
+                  type: "START_GAME"
+                });
+
+                console.log("START_GAME ENVOYE");
+              }
+            }, 3000);
           }
-          break;
-        }
 
-        case "PLAYER_CANCEL_READY": {
-          const roomCode = ws.roomCode;
-          const room = rooms.get(roomCode);
-          if (!room) return;
-
-          room.readyStates.set(ws, false);
-          break;
-        }
-
-        case "GAME_EVENT": {
-          const roomCode = ws.roomCode;
-          const room = rooms.get(roomCode);
-          if (!room) return;
-
-          for (const player of room.players) {
-            if (player.ws !== ws && player.ws.readyState === WebSocket.OPEN) {
-              player.ws.send(JSON.stringify({
-                type: "GAME_EVENT",
-                eventName: data.eventName,
-                payload: data.payload || null
-              }));
-            }
-          }
           break;
         }
 
         default: {
+          console.log("TYPE INCONNU :", data.type);
           send(ws, {
             type: "ERROR",
             message: "Type de message inconnu"
@@ -188,8 +269,8 @@ wss.on("connection", (ws) => {
           break;
         }
       }
-    } catch (err) {
-      console.error("Erreur message :", err);
+    } catch (error) {
+      console.error("ERREUR MESSAGE :", error);
       send(ws, {
         type: "ERROR",
         message: "Message invalide"
@@ -200,29 +281,31 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     console.log("Client déconnecté");
 
-    const roomCode = ws.roomCode;
-    if (!roomCode) return;
+    if (currentRoomCode && currentPlayerId && rooms[currentRoomCode]) {
+      delete rooms[currentRoomCode].players[currentPlayerId];
 
-    const room = rooms.get(roomCode);
-    if (!room) return;
+      const remainingIds = getPlayerIds(rooms[currentRoomCode]);
 
-    room.players = room.players.filter((p) => p.ws !== ws);
-    room.readyStates.delete(ws);
+      if (remainingIds.length === 0) {
+        delete rooms[currentRoomCode];
+        console.log("Salle supprimée :", currentRoomCode);
+      } else {
+        assignRoles(rooms[currentRoomCode]);
+        sendRoleUpdateToAll(currentRoomCode);
 
-    if (room.players.length === 0) {
-      rooms.delete(roomCode);
-      console.log(`Salle supprimée : ${roomCode}`);
-    } else {
-      broadcast(roomCode, {
-        type: "PLAYER_LEFT",
-        playerCount: room.players.length
-      });
+        broadcastToRoom(currentRoomCode, {
+          type: "PLAYER_JOINED",
+          playerCount: remainingIds.length
+        });
+      }
     }
+  });
+
+  ws.on("error", (error) => {
+    console.error("ERREUR WS :", error);
   });
 });
 
-const PORT = process.env.PORT || 3000;
-
 server.listen(PORT, () => {
-  console.log(`Serveur démarré sur le port ${PORT}`);
+  console.log(`Serveur lancé sur le port ${PORT}`);
 });
